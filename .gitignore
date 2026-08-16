@@ -17,10 +17,15 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Environment
+# Environment & Secrets
 .env
 .env.local
 .env.*.local
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
 
 # Database
 *.db
