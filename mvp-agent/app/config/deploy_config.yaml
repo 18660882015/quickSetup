@@ -1,0 +1,84 @@
+# MVP AI部署助手 - 部署默认配置
+# ==============================
+# 本文件定义部署流程的默认参数、超时、危险命令拦截规则。
+
+# 部署流程步骤定义（顺序执行）
+deploy_steps:
+  - precheck        # 预检：端口占用、磁盘空间、服务状态
+  - backup          # 备份当前版本
+  - transfer        # 传输部署包
+  - install         # 安装（拷贝/解压文件）
+  - configure       # 配置更新
+  - start_service   # 启动服务
+  - validate        # 三重验证
+  - cleanup         # 清理临时文件
+
+# 默认端口
+default_ports:
+  nginx: 80
+  tomcat: 8080
+  mysql: 3306
+  redis: 6379
+
+# 超时配置（秒）
+timeout:
+  ssh_connect: 10        # SSH 连接超时
+  ssh_command: 60        # 单条 SSH 命令超时
+  deploy: 300            # 整体部署超时
+  upload: 600            # 文件上传超时
+  health_check: 5        # HTTP 健康检查超时
+
+# 备份配置
+backup:
+  max_count: 5           # 最大保留备份数量
+
+# 危险命令列表（正则匹配，拦截后需人工确认）
+dangerous_commands:
+  - "rm\\s+-rf\\s+/"           # rm -rf 根目录
+  - "rm\\s+-rf\\s+\\*"         # rm -rf 通配
+  - "del\\s+/[fqsS].*C:"       # Windows 删除命令
+  - "format\\s+"               # 格式化磁盘
+  - "shutdown"                 # 关机
+  - "reboot"                   # 重启
+  - "halt"                     # 停机
+  - "init\\s+0"                # 关机
+  - "mkfs"                     # 格式化文件系统
+  - "dd\\s+.*of=/dev/"        # 写入设备
+  - ":\\(\\)\\{.*\\|:&\\}"     # fork 炸弹
+  - "chmod\\s+-R\\s+777\\s+/" # 递归 777 根目录
+  - "DROP\\s+DATABASE"        # 删库
+  - "DROP\\s+TABLE"           # 删表
+  - "TRUNCATE\\s+TABLE"       # 清空表
+
+# 健康检查关键字（日志中出现视为异常）
+log_error_keywords:
+  - "ERROR"
+  - "Exception"
+  - "OutOfMemoryError"
+  - "StackOverflowError"
+  - "NullPointerException"
+  - "FATAL"
+  - "CRITICAL"
+
+# JVM 默认参数
+jvm_defaults:
+  jdk8: "-Xms256m -Xmx512m -XX:PermSize=128m -XX:MaxPermSize=256m"
+  jdk17: "-Xms256m -Xmx512m -XX:MetaspaceSize=128m -XX:MaxMetaspaceSize=256m"
+
+# 服务管理命令模板
+service_commands:
+  linux:
+    nginx_start: "nginx"
+    nginx_stop: "nginx -s stop"
+    nginx_restart: "nginx -s reload"
+    tomcat_start: "nohup {{catalina_home}}/bin/startup.sh &"
+    tomcat_stop: "{{catalina_home}}/bin/shutdown.sh"
+    mysql_start: "systemctl start mysqld"
+    mysql_stop: "systemctl stop mysqld"
+    redis_start: "redis-server --daemonize yes"
+    redis_stop: "redis-cli shutdown"
+  windows:
+    nginx_start: "nginx.exe"
+    nginx_stop: "nginx.exe -s stop"
+    tomcat_start: "{{catalina_home}}\\bin\\startup.bat"
+    tomcat_stop: "{{catalina_home}}\\bin\\shutdown.bat"

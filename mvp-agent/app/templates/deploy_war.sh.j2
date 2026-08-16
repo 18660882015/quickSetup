@@ -1,0 +1,73 @@
+#!/bin/bash
+# Linux 部署 WAR 包脚本
+# 由 RemoteDeployEngine 通过 Jinja2 渲染生成
+# ==============================
+set -e
+
+# 参数（由模板渲染注入）
+JDK_VERSION="{{ jdk_version }}"
+DEPLOY_DIR="{{ deploy_dir }}"
+BACKEND_FILE="{{ backend_file }}"
+REMOTE_TMP="{{ remote_tmp }}"
+ENV_TYPE="{{ env_type }}"
+JVM_ARGS="{{ jvm_args }}"
+DB_NAME="{{ db_name }}"
+
+echo "=============================="
+echo "开始部署 WAR 包: ${BACKEND_FILE}"
+echo "JDK 版本: ${JDK_VERSION}"
+echo "环境类型: ${ENV_TYPE}"
+echo "=============================="
+
+# Tomcat 路径
+CATALINA_HOME="${DEPLOY_DIR}/tomcat"
+WEBAPPS_DIR="${CATALINA_HOME}/webapps"
+
+# 确保目录存在
+mkdir -p "${WEBAPPS_DIR}"
+
+# 停止 Tomcat
+echo "停止 Tomcat..."
+if [ -f "${CATALINA_HOME}/bin/shutdown.sh" ]; then
+    "${CATALINA_HOME}/bin/shutdown.sh" 2>/dev/null || true
+    sleep 3
+    # 强制终止残留进程
+    PID=$(pgrep -f "catalina" 2>/dev/null || echo "")
+    if [ -n "${PID}" ]; then
+        echo "强制终止 Tomcat 进程: ${PID}"
+        kill -9 ${PID} 2>/dev/null || true
+        sleep 1
+    fi
+fi
+
+# 清理旧部署
+echo "清理旧部署..."
+rm -rf "${WEBAPPS_DIR}/ROOT" 2>/dev/null || true
+rm -f "${WEBAPPS_DIR}/ROOT.war" 2>/dev/null || true
+
+# 复制 WAR 包
+echo "复制 WAR 包..."
+cp -f "${REMOTE_TMP}/${BACKEND_FILE}" "${WEBAPPS_DIR}/ROOT.war"
+
+# 启动 Tomcat
+echo "启动 Tomcat..."
+if [ -f "${CATALINA_HOME}/bin/startup.sh" ]; then
+    export CATALINA_HOME
+    nohup "${CATALINA_HOME}/bin/startup.sh" > "${DEPLOY_DIR}/tomcat.log" 2>&1 &
+    echo "Tomcat 启动中..."
+    sleep 5
+    # 检查进程
+    if pgrep -f "catalina" >/dev/null 2>&1; then
+        echo "Tomcat 启动成功"
+    else
+        echo "错误: Tomcat 启动失败"
+        cat "${DEPLOY_DIR}/tomcat.log" 2>/dev/null || true
+        exit 1
+    fi
+else
+    echo "警告: 未找到 Tomcat startup.sh，跳过启动"
+fi
+
+echo "=============================="
+echo "WAR 包部署完成"
+echo "=============================="

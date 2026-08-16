@@ -1,0 +1,58 @@
+@echo off
+REM Windows 本地部署脚本模板
+REM 由 Jinja2 渲染生成
+REM ==============================
+
+set NGINX_HOME={{ nginx_home }}
+set TOMCAT_HOME={{ tomcat_home }}
+set MYSQL_HOME={{ mysql_home }}
+set DEPLOY_DIR={{ deploy_dir }}
+set ENV_TYPE={{ env_type }}
+
+echo ==============================
+echo 开始本地部署
+echo 环境类型: %ENV_TYPE%
+echo ==============================
+
+REM 停止 Nginx
+echo 停止 Nginx...
+taskkill /F /IM nginx.exe 2>nul || echo Nginx 未运行
+
+REM 停止 Tomcat
+echo 停止 Tomcat...
+taskkill /F /IM java.exe 2>nul || echo Tomcat 未运行
+
+REM 备份当前版本
+echo 备份当前版本...
+if exist "%TOMCAT_HOME%\webapps\ROOT.war" (
+    copy /Y "%TOMCAT_HOME%\webapps\ROOT.war" "%DEPLOY_DIR%\backup\ROOT.war.bak"
+)
+
+REM 部署后端
+echo 部署后端...
+copy /Y "%DEPLOY_DIR%\backend.war" "%TOMCAT_HOME%\webapps\ROOT.war"
+
+REM 部署前端
+echo 部署前端...
+if exist "%DEPLOY_DIR%\frontend.zip" (
+    powershell -Command "Expand-Archive -Path '%DEPLOY_DIR%\frontend.zip' -DestinationPath '%NGINX_HOME%\html' -Force"
+)
+
+REM 导入 SQL
+if exist "%DEPLOY_DIR%\init.sql" (
+    echo 导入 SQL...
+    "%MYSQL_HOME%\bin\mysql.exe" -u root < "%DEPLOY_DIR%\init.sql"
+)
+
+REM 启动 Tomcat
+echo 启动 Tomcat...
+start "" "%TOMCAT_HOME%\bin\startup.bat"
+
+REM 启动 Nginx
+echo 启动 Nginx...
+cd /d "%NGINX_HOME%"
+start "" nginx.exe
+
+echo ==============================
+echo 部署完成
+echo ==============================

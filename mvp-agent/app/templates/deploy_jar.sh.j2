@@ -1,0 +1,85 @@
+#!/bin/bash
+# Linux 部署 JAR 包脚本
+# 由 RemoteDeployEngine 通过 Jinja2 渲染生成
+# ==============================
+set -e
+
+# 参数（由模板渲染注入）
+JDK_VERSION="{{ jdk_version }}"
+DEPLOY_DIR="{{ deploy_dir }}"
+BACKEND_FILE="{{ backend_file }}"
+REMOTE_TMP="{{ remote_tmp }}"
+ENV_TYPE="{{ env_type }}"
+JVM_ARGS="{{ jvm_args }}"
+DB_NAME="{{ db_name }}"
+
+echo "=============================="
+echo "开始部署 JAR 包: ${BACKEND_FILE}"
+echo "JDK 版本: ${JDK_VERSION}"
+echo "环境类型: ${ENV_TYPE}"
+echo "部署目录: ${DEPLOY_DIR}"
+echo "=============================="
+
+# 确保部署目录存在
+mkdir -p "${DEPLOY_DIR}"
+
+# JDK 路径（根据版本选择）
+if [ "${JDK_VERSION}" = "17" ]; then
+    JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-17}"
+else
+    JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-8}"
+fi
+
+# 如果 JAVA_HOME 不存在，尝试从 PATH 查找
+if [ ! -d "${JAVA_HOME}" ]; then
+    JAVA_BIN=$(which java 2>/dev/null || echo "")
+    if [ -z "${JAVA_BIN}" ]; then
+        echo "警告: 未找到 Java，请确保已安装 JDK ${JDK_VERSION}"
+    fi
+else
+    JAVA_BIN="${JAVA_HOME}/bin/java"
+fi
+
+# 停止旧进程
+echo "停止旧进程..."
+PID=$(pgrep -f "${BACKEND_FILE}" 2>/dev/null || echo "")
+if [ -n "${PID}" ]; then
+    echo "找到旧进程 PID=${PID}，正在停止..."
+    kill "${PID}" 2>/dev/null || true
+    sleep 2
+    # 如果还在运行，强制终止
+    if pgrep -f "${BACKEND_FILE}" >/dev/null 2>&1; then
+        echo "进程未停止，强制终止..."
+        kill -9 "${PID}" 2>/dev/null || true
+    fi
+fi
+
+# 复制 JAR 文件到部署目录
+echo "复制 JAR 文件..."
+cp -f "${REMOTE_TMP}/${BACKEND_FILE}" "${DEPLOY_DIR}/"
+
+# 启动新服务
+echo "启动服务..."
+if [ -n "${JAVA_BIN}" ]; then
+    nohup "${JAVA_BIN}" ${JVM_ARGS} \
+        -jar "${DEPLOY_DIR}/${BACKEND_FILE}" \
+        --spring.profiles.active="${ENV_TYPE}" \
+        > "${DEPLOY_DIR}/app.log" 2>&1 &
+    NEW_PID=$!
+    echo "服务已启动，PID=${NEW_PID}"
+    sleep 2
+    # 检查进程是否存活
+    if kill -0 "${NEW_PID}" 2>/dev/null; then
+        echo "服务启动成功"
+    else
+        echo "错误: 服务启动后立即退出"
+        cat "${DEPLOY_DIR}/app.log" 2>/dev/null || true
+        exit 1
+    fi
+else
+    echo "警告: 未找到 Java，跳过启动"
+fi
+
+echo "=============================="
+echo "JAR 包部署完成"
+echo "=============================="
