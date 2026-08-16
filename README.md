@@ -419,5 +419,3 @@ mvp/
 └── docs/
     └── api.md                     # API 文档说明
 ```
-#   q u i c k S e t u p  
- 
