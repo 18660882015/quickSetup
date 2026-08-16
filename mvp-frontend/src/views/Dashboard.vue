@@ -1,7 +1,7 @@
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { Monitor, Upload, Clock, Check, Cpu, Warning } from '@element-plus/icons-vue'
+import { Monitor, Upload, Clock, Check, Cpu, Warning, Refresh } from '@element-plus/icons-vue'
 import { getHistory } from '@/api/deploy'
 import { getHosts } from '@/api/host'
 import { getConfigs } from '@/api/config'
@@ -151,7 +151,41 @@ const goHosts = () => router.push('/hosts')
 const goHistory = () => router.push('/history')
 const goConfig = () => router.push('/config')
 
-onMounted(fetchDashboard)
+// 自动刷新（默认开启，每 5 秒）
+const autoRefresh = ref(localStorage.getItem('dashboardAutoRefresh') !== 'false')
+let refreshTimer = null
+
+function startAutoRefresh() {
+  stopAutoRefresh()
+  refreshTimer = setInterval(() => {
+    fetchDashboard()
+  }, 5000)
+}
+
+function stopAutoRefresh() {
+  if (refreshTimer) {
+    clearInterval(refreshTimer)
+    refreshTimer = null
+  }
+}
+
+function toggleAutoRefresh(val) {
+  localStorage.setItem('dashboardAutoRefresh', String(val))
+  if (val) {
+    startAutoRefresh()
+  } else {
+    stopAutoRefresh()
+  }
+}
+
+onMounted(() => {
+  fetchDashboard()
+  if (autoRefresh.value) {
+    startAutoRefresh()
+  }
+})
+
+onUnmounted(stopAutoRefresh)
 </script>
 
 <template>
@@ -213,6 +247,20 @@ onMounted(fetchDashboard)
             <span class="threshold-info">
               阈值：CPU {{ thresholds.cpu }}% / 内存 {{ thresholds.memory }}% / 磁盘 {{ thresholds.disk }}%
             </span>
+            <el-switch
+              v-model="autoRefresh"
+              size="small"
+              active-text="自动刷新"
+              @change="toggleAutoRefresh"
+              class="refresh-switch"
+            />
+            <el-button
+              :icon="Refresh"
+              size="small"
+              circle
+              :loading="loading"
+              @click="fetchDashboard"
+            />
           </div>
         </div>
       </template>
@@ -393,6 +441,10 @@ onMounted(fetchDashboard)
   font-size: 12px;
   color: #909399;
   font-weight: 400;
+}
+
+.refresh-switch {
+  margin-left: 8px;
 }
 
 .monitor-empty {

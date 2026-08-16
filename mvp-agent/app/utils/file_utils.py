@@ -130,3 +130,32 @@ def get_file_size_str(size_bytes: int) -> str:
             return f"{size_bytes:.1f} {unit}"
         size_bytes /= 1024.0
     return f"{size_bytes:.1f} PB"
+
+
+def file_md5(path: str, chunk_size: int = 1024 * 1024) -> Optional[str]:
+    """计算文件 MD5（增量传输比对用）"""
+    import hashlib
+
+    h = hashlib.md5()
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except (OSError, IOError):
+        return None
+
+
+def files_identical(src: str, dst: str) -> bool:
+    """快速判断两文件是否相同（大小 + MD5）"""
+    try:
+        if not os.path.exists(dst):
+            return False
+        if os.path.getsize(src) != os.path.getsize(dst):
+            return False
+        return file_md5(src) == file_md5(dst)
+    except OSError:
+        return False

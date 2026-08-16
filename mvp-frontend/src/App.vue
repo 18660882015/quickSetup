@@ -3,6 +3,9 @@ import { ref, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessageBox } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
+import { useTheme } from '@/composables/useTheme'
+import { useI18n } from '@/composables/useI18n'
+import AiChat from '@/components/AiChat.vue'
 import {
   Odometer,
   Monitor,
@@ -12,12 +15,19 @@ import {
   Fold,
   Expand,
   SwitchButton,
-  User
+  User,
+  Sunny,
+  Moon,
+  Monitor as MonitorIcon,
+  ChatDotRound,
+  ArrowDown
 } from '@element-plus/icons-vue'
 
 const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
+const { theme, setTheme } = useTheme()
+const { locale, setLocale, translate: $t } = useI18n()
 
 const isCollapse = ref(false)
 const toggleCollapse = () => {
@@ -28,18 +38,18 @@ const toggleCollapse = () => {
 const isLoginPage = computed(() => route.path === '/login')
 
 const menuItems = [
-  { index: '/', title: 'Dashboard', icon: Odometer },
-  { index: '/hosts', title: '主机管理', icon: Monitor },
-  { index: '/deploy', title: '部署向导', icon: Upload },
-  { index: '/history', title: '部署历史', icon: Clock },
-  { index: '/config', title: '系统配置', icon: Setting }
+  { index: '/', titleKey: 'menu.dashboard', icon: Odometer },
+  { index: '/hosts', titleKey: 'menu.hosts', icon: Monitor },
+  { index: '/deploy', titleKey: 'menu.deploy', icon: Upload },
+  { index: '/history', titleKey: 'menu.history', icon: Clock },
+  { index: '/config', titleKey: 'menu.config', icon: Setting }
 ]
 
 const activeMenu = computed(() => route.path)
 
 const currentTitle = computed(() => {
   const item = menuItems.find((m) => m.index === route.path)
-  return item ? item.title : 'MVP AI 部署助手'
+  return item ? $t(item.titleKey) : $t('app.name')
 })
 
 const handleSelect = (index) => {
@@ -51,9 +61,9 @@ const handleSelect = (index) => {
 const handleCommand = async (command) => {
   if (command === 'logout') {
     try {
-      await ElMessageBox.confirm('确定要退出登录吗？', '提示', {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
+      await ElMessageBox.confirm($t('app.logoutConfirm'), $t('app.logoutTitle'), {
+        confirmButtonText: $t('app.confirm'),
+        cancelButtonText: $t('app.cancel'),
         type: 'warning'
       })
       authStore.logout()
@@ -63,6 +73,22 @@ const handleCommand = async (command) => {
     }
   }
 }
+
+// 主题切换
+const themeOptions = computed(() => [
+  { value: 'light', label: $t('theme.light'), icon: Sunny },
+  { value: 'dark', label: $t('theme.dark'), icon: Moon },
+  { value: 'auto', label: $t('theme.auto'), icon: MonitorIcon }
+])
+
+// 语言切换
+const langOptions = [
+  { value: 'zh', label: '中文' },
+  { value: 'en', label: 'English' }
+]
+
+// AI 助手抽屉
+const aiChatVisible = ref(false)
 </script>
 
 <template>
@@ -76,7 +102,7 @@ const handleCommand = async (command) => {
     <el-aside :width="isCollapse ? '64px' : '220px'" class="app-aside">
       <div class="logo">
         <el-icon class="logo-icon"><Upload /></el-icon>
-        <span v-show="!isCollapse" class="logo-text">AI部署助手</span>
+        <span v-show="!isCollapse" class="logo-text">{{ $t('app.name') }}</span>
       </div>
       <el-menu
         :default-active="activeMenu"
@@ -89,7 +115,7 @@ const handleCommand = async (command) => {
       >
         <el-menu-item v-for="item in menuItems" :key="item.index" :index="item.index">
           <el-icon><component :is="item.icon" /></el-icon>
-          <template #title>{{ item.title }}</template>
+          <template #title>{{ $t(item.titleKey) }}</template>
         </el-menu-item>
       </el-menu>
     </el-aside>
@@ -103,6 +129,51 @@ const handleCommand = async (command) => {
           <span class="header-title">{{ currentTitle }}</span>
         </div>
         <div class="header-right">
+          <el-dropdown @command="setTheme" trigger="click">
+            <span class="theme-trigger">
+              <el-icon>
+                <component :is="theme === 'dark' ? Moon : theme === 'light' ? Sunny : MonitorIcon" />
+              </el-icon>
+            </span>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item
+                  v-for="opt in themeOptions"
+                  :key="opt.value"
+                  :command="opt.value"
+                  :class="{ 'is-active': theme === opt.value }"
+                >
+                  <el-icon><component :is="opt.icon" /></el-icon>
+                  {{ opt.label }}
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+
+          <el-dropdown @command="setLocale" trigger="click">
+            <span class="theme-trigger lang-trigger">
+              <span class="lang-label">{{ locale === 'en' ? 'EN' : '中' }}</span>
+            </span>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item
+                  v-for="opt in langOptions"
+                  :key="opt.value"
+                  :command="opt.value"
+                  :class="{ 'is-active': locale === opt.value }"
+                >
+                  {{ opt.label }}
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+
+          <el-tooltip :content="$t('app.aiAssistant')" placement="bottom">
+            <el-icon class="header-action-btn" @click="aiChatVisible = true">
+              <ChatDotRound />
+            </el-icon>
+          </el-tooltip>
+
           <el-dropdown @command="handleCommand">
             <span class="user-info">
               <el-icon class="user-avatar"><User /></el-icon>
@@ -112,7 +183,7 @@ const handleCommand = async (command) => {
             <template #dropdown>
               <el-dropdown-menu>
                 <el-dropdown-item command="logout" :icon="SwitchButton">
-                  退出登录
+                  {{ $t('app.logout') }}
                 </el-dropdown-item>
               </el-dropdown-menu>
             </template>
@@ -128,6 +199,9 @@ const handleCommand = async (command) => {
         </router-view>
       </el-main>
     </el-container>
+
+    <!-- AI 对话助手抽屉 -->
+    <AiChat v-model="aiChatVisible" />
   </el-container>
 </template>
 
@@ -178,8 +252,7 @@ const handleCommand = async (command) => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  background-color: #fff;
-  border-bottom: 1px solid #e8e8e8;
+  border-bottom: 1px solid var(--el-border-color-light);
   padding: 0 20px;
   box-shadow: 0 1px 4px rgba(0, 21, 41, 0.08);
 }
@@ -193,7 +266,7 @@ const handleCommand = async (command) => {
 .collapse-btn {
   font-size: 20px;
   cursor: pointer;
-  color: #5a5e66;
+  color: var(--el-text-color-primary);
 }
 
 .collapse-btn:hover {
@@ -203,12 +276,46 @@ const handleCommand = async (command) => {
 .header-title {
   font-size: 16px;
   font-weight: 600;
-  color: #303133;
+  color: var(--el-text-color-primary);
 }
 
 .header-right {
   display: flex;
   align-items: center;
+  gap: 18px;
+}
+
+.theme-trigger {
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  font-size: 18px;
+  color: var(--el-text-color-primary);
+  outline: none;
+}
+
+.theme-trigger:hover {
+  color: #409eff;
+}
+
+.lang-trigger {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.lang-label {
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+
+.header-action-btn {
+  font-size: 18px;
+  cursor: pointer;
+  color: var(--el-text-color-primary);
+}
+
+.header-action-btn:hover {
+  color: #409eff;
 }
 
 .user-info {
@@ -216,7 +323,7 @@ const handleCommand = async (command) => {
   align-items: center;
   gap: 6px;
   cursor: pointer;
-  color: #5a5e66;
+  color: var(--el-text-color-primary);
   outline: none;
 }
 
@@ -230,7 +337,7 @@ const handleCommand = async (command) => {
 }
 
 .app-main {
-  background-color: #f0f2f5;
+  background-color: var(--el-bg-color-page);
   padding: 20px;
   overflow-y: auto;
 }

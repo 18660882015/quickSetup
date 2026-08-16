@@ -1,12 +1,16 @@
 """
-AI 服务 - DeepSeek API 集成
+AI 服务 - 多 Provider 集成（DeepSeek 云端 / Ollama 本地）
 
-- 使用 openai.AsyncOpenAI 客户端（兼容 DeepSeek API 格式）
+- 使用 openai.AsyncOpenAI 客户端（兼容 DeepSeek / Ollama OpenAI 格式）
+- provider 切换：sys_configs.ai_provider = deepseek / ollama
 - generate_deploy_plan: 生成结构化部署计划（JSON Mode）
 - analyze_error: 分析部署错误给出修复建议
 - generate_monitor_summary: 生成监控日报自然语言总结
+- chat: 通用多轮对话（AI 运维助手）
+- optimize_config: JVM/Nginx/MySQL 配置优化建议
+- generate_deploy_script: AI 生成完整部署脚本
 - _fallback_plan: AI 不可用时返回预设默认计划
-- 每次请求从 sys_configs 读取最新 api_key 和 model（配置热更新）
+- 每次请求从 sys_configs 读取最新配置（配置热更新）
 """
 import json
 from datetime import datetime
@@ -25,16 +29,36 @@ logger = get_logger("ai_service")
 # 配置热更新：每次请求读取最新 sys_configs
 # ======================================================================
 def _load_ai_config() -> Dict[str, str]:
-    """从 sys_configs 读取最新 AI 配置（配置热更新）"""
+    """从 sys_configs 读取最新 AI 配置（配置热更新）
+
+    根据 ai_provider 切换：
+    - deepseek: 云端 API（需要 api_key）
+    - ollama: 本地 Ollama 服务（无需 api_key，OpenAI 兼容地址 /v1）
+    """
     db = SessionLocal()
     try:
+        provider = get_config_value(db, "ai_provider", "deepseek").lower()
+
+        if provider == "ollama":
+            base_url = get_config_value(db, "ollama_base_url", "http://localhost:11434")
+            model = get_config_value(db, "ollama_model", "qwen2.5:7b")
+            return {
+                "provider": "ollama",
+                "api_key": "ollama",  # Ollama 不需要真实 key，占位
+                "base_url": base_url.rstrip("/") + "/v1",
+                "model": model,
+                "supports_json_mode": False,  # 部分本地模型不支持 response_format
+            }
+
         api_key = get_config_value(db, "deepseek_api_key", "")
         base_url = get_config_value(db, "deepseek_base_url", "https://api.deepseek.com")
         model = get_config_value(db, "deepseek_model", "deepseek-chat")
         return {
+            "provider": "deepseek",
             "api_key": api_key,
             "base_url": base_url,
             "model": model,
+            "supports_json_mode": True,
         }
     finally:
         db.close()
@@ -46,6 +70,58 @@ def _create_client(config: Dict[str, str]) -> AsyncOpenAI:
         api_key=config["api_key"],
         base_url=config["base_url"],
     )
+
+
+async def _chat_completion(
+    config: Dict[str, str],
+    messages: List[dict],
+    temperature: float = 0.3,
+    max_tokens: int = 2000,
+    json_mode: bool = False,
+) -> str:
+    """通用对话补全，返回文本内容
+
+    json_mode 仅在 provider 支持时启用（DeepSeek 支持，Ollama 部分模型不支持）。
+    JSON 解析失败时尝试从文本中提取 JSON 块。
+    """
+    kwargs = {
+        "model": config["model"],
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if json_mode and config.get("supports_json_mode"):
+        kwargs["response_format"] = {"type": "json_object"}
+
+    client = _create_client(config)
+    response = await client.chat.completions.create(**kwargs)
+    return response.choices[0].message.content
+
+
+def _extract_json(text: str) -> Optional[dict]:
+    """从 AI 回复文本中提取 JSON 对象（兼容 ```json 代码块包裹）"""
+    text = text.strip()
+    # 去掉 markdown 代码块
+    if "```" in text:
+        parts = text.split("```")
+        for part in parts:
+            candidate = part.strip()
+            if candidate.startswith("json"):
+                candidate = candidate[4:].strip()
+            if candidate.startswith("{") and candidate.endswith("}"):
+                text = candidate
+                break
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # 尝试找第一个 { 到最后一个 }
+        start, end = text.find("{"), text.rfind("}")
+        if 0 <= start < end:
+            try:
+                return json.loads(text[start:end + 1])
+            except json.JSONDecodeError:
+                return None
+    return None
 
 
 # ======================================================================
@@ -475,24 +551,15 @@ async def test_connection(message: str = "你好，请回复：AI 服务正常")
     if not config["api_key"]:
         return {
             "success": False,
-            "message": "未配置 DeepSeek API Key",
+            "message": "未配置 AI 服务（DeepSeek API Key 为空且未启用 Ollama）",
             "reply": None,
         }
 
     try:
-        client = _create_client(config)
-        response = await client.chat.completions.create(
-            model=config["model"],
-            messages=[
-                {"role": "user", "content": message},
-            ],
-            max_tokens=100,
-        )
-
-        reply = response.choices[0].message.content
+        reply = await _chat_completion(config, [{"role": "user", "content": message}], max_tokens=100)
         return {
             "success": True,
-            "message": "AI 接口连接正常",
+            "message": f"AI 接口连接正常（provider={config['provider']}, model={config['model']}）",
             "reply": reply,
         }
 
@@ -502,3 +569,201 @@ async def test_connection(message: str = "你好，请回复：AI 服务正常")
             "message": f"AI 接口连接失败: {e}",
             "reply": None,
         }
+
+
+# ======================================================================
+# AI 对话式运维
+# ======================================================================
+async def chat(
+    messages: List[dict],
+    context: Optional[dict] = None,
+) -> Dict[str, Any]:
+    """AI 运维助手对话
+
+    Args:
+        messages: 多轮对话历史 [{"role": "user"/"assistant", "content": "..."}]
+        context: 运维上下文（当前部署记录/主机列表/监控摘要）
+
+    Returns:
+        {"success": bool, "reply": str}
+    """
+    config = _load_ai_config()
+
+    if not config["api_key"]:
+        return {
+            "success": False,
+            "reply": "AI 服务未配置。请在系统配置中填写 DeepSeek API Key 或启用 Ollama 本地模型。",
+        }
+
+    system_prompt = (
+        "你是 MVP AI部署助手内置的运维助手，帮助个人开发者解决部署和运维问题。"
+        "你擅长：部署排错、JVM/Nginx/MySQL 配置优化、Shell/Batch 脚本编写、项目结构分析。"
+        "回答用中文，简洁实用，给出可直接执行的命令或配置。"
+    )
+
+    if context:
+        ctx_parts = []
+        if context.get("deploy_records"):
+            records = context["deploy_records"][:3]
+            for r in records:
+                ctx_parts.append(
+                    f"- 项目 {r.get('project_name')} / 主机 {r.get('host_ip', '本地')} / "
+                    f"状态 {r.get('execute_status')} / 错误: {(r.get('error_message') or '无')[:200]}"
+                )
+        if context.get("hosts"):
+            hosts = context["hosts"][:5]
+            for h in hosts:
+                ctx_parts.append(f"- 主机 {h.get('name')} ({h.get('ip')}) JDK{h.get('jdk_version', '?')}")
+        if context.get("monitor_summary"):
+            ctx_parts.append(f"- 监控摘要: {context['monitor_summary'][:300]}")
+
+        if ctx_parts:
+            system_prompt += "\n\n## 当前系统上下文\n" + "\n".join(ctx_parts)
+
+    all_messages = [{"role": "system", "content": system_prompt}] + messages[-20:]
+
+    try:
+        reply = await _chat_completion(config, all_messages, temperature=0.5, max_tokens=1500)
+        return {"success": True, "reply": reply}
+    except Exception as e:
+        logger.error(f"AI 对话失败: {e}")
+        return {"success": False, "reply": f"AI 调用失败: {e}"}
+
+
+# ======================================================================
+# AI 配置优化建议
+# ======================================================================
+async def optimize_config(
+    config_type: str,
+    host_info: Optional[dict] = None,
+    current_config: Optional[str] = None,
+) -> Dict[str, Any]:
+    """生成 JVM / Nginx / MySQL 配置优化建议
+
+    Args:
+        config_type: jvm / nginx / mysql
+        host_info: 主机信息（cpu_cores, memory_gb, role 等）
+        current_config: 当前配置文件内容（可选）
+
+    Returns:
+        {"success": bool, "suggestion": str, "config": str}
+    """
+    config = _load_ai_config()
+
+    if not config["api_key"]:
+        return {"success": False, "suggestion": "AI 服务未配置，无法生成优化建议。"}
+
+    type_prompts = {
+        "jvm": "请优化 JVM 启动参数（-Xms -Xmx -XX:+UseG1GC 等），根据主机内存和 CPU 给出建议。",
+        "nginx": "请优化 Nginx 配置（worker_processes、keepalive_timeout、gzip、缓冲区等）。",
+        "mysql": "请优化 MySQL 配置（innodb_buffer_pool_size、max_connections、慢查询等）。",
+    }
+    if config_type not in type_prompts:
+        return {"success": False, "suggestion": f"不支持的配置类型: {config_type}（支持 jvm/nginx/mysql）"}
+
+    host_desc = ""
+    if host_info:
+        cpu = host_info.get("cpu_cores", "未知")
+        mem = host_info.get("memory_gb") or host_info.get("memory_info", "未知")
+        host_desc = f"CPU 核心数: {cpu}, 内存: {mem}GB\n"
+
+    user_prompt = (
+        f"## 配置优化请求\n\n"
+        f"### 主机配置\n{host_desc or '未知（按 4核16G 通用服务器建议）'}\n\n"
+    )
+    if current_config:
+        current_config = current_config[:3000]
+        user_prompt += f"### 当前配置\n```\n{current_config}\n```\n\n"
+    user_prompt += f"### 任务\n{type_prompts[config_type]}\n\n"
+    user_prompt += "请返回：1) 优化建议说明（简洁要点）；2) 推荐的完整配置片段（代码块）。"
+
+    try:
+        reply = await _chat_completion(
+            config,
+            [
+                {"role": "system", "content": "你是一位性能调优专家，擅长根据硬件配置给出中间件调优参数。回答用中文。"},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+            max_tokens=1500,
+        )
+        return {"success": True, "suggestion": reply}
+    except Exception as e:
+        logger.error(f"AI 配置优化失败: {e}")
+        return {"success": False, "suggestion": f"AI 调用失败: {e}"}
+
+
+# ======================================================================
+# AI 生成部署脚本
+# ======================================================================
+async def generate_deploy_script(
+    project_structure: str,
+    target_type: str = "linux",
+    requirements: str = "",
+) -> Dict[str, Any]:
+    """AI 生成完整部署脚本
+
+    Args:
+        project_structure: 项目结构描述（目录树或关键文件说明）
+        target_type: linux (Shell) / windows (Batch)
+        requirements: 特殊要求（如服务启动顺序、回滚逻辑）
+
+    Returns:
+        {"success": bool, "script": str, "explanation": str}
+    """
+    config = _load_ai_config()
+
+    if not config["api_key"]:
+        return {"success": False, "script": "", "explanation": "AI 服务未配置，无法生成脚本。"}
+
+    script_type = "Bash Shell 脚本" if target_type == "linux" else "Windows Batch 脚本"
+    ext_hint = ".sh" if target_type == "linux" else ".bat"
+
+    user_prompt = (
+        f"## 部署脚本生成请求\n\n"
+        f"### 项目结构\n{project_structure[:3000]}\n\n"
+        f"### 脚本类型\n{script_type}\n\n"
+        f"### 特殊要求\n{requirements or '无'}\n\n"
+        f"### 要求\n"
+        f"1. 生成完整的、可直接执行的部署脚本\n"
+        f"2. 包含错误处理（set -e / errorlevel 检查）和日志输出\n"
+        f"3. 部署前备份、失败自动回滚\n"
+        f"4. 返回格式：先给出脚本说明（要点列表），然后是完整脚本代码块（{ext_hint}）"
+    )
+
+    try:
+        reply = await _chat_completion(
+            config,
+            [
+                {"role": "system", "content": "你是一位 DevOps 脚本专家，擅长编写健壮的部署脚本。回答用中文。"},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+            max_tokens=3000,
+        )
+
+        # 提取代码块
+        script = ""
+        if "```" in reply:
+            parts = reply.split("```")
+            for i, part in enumerate(parts):
+                candidate = part.strip()
+                if candidate.startswith(("bash", "sh", "shell", "batch", "bat")):
+                    candidate = candidate.split("\n", 1)[-1]
+                if ("#!/" in candidate or "@echo" in candidate.lower() or "set " in candidate.lower()) and len(candidate) > 50:
+                    script = candidate
+                    break
+            if not script:
+                # 取最长的代码块
+                code_blocks = [p.strip() for p in parts if len(p.strip()) > 100]
+                if code_blocks:
+                    block = max(code_blocks, key=len)
+                    if block.lower().startswith(("bash", "sh", "shell", "batch")):
+                        block = block.split("\n", 1)[-1]
+                    script = block
+
+        return {"success": True, "script": script, "explanation": reply}
+    except Exception as e:
+        logger.error(f"AI 脚本生成失败: {e}")
+        return {"success": False, "script": "", "explanation": f"AI 调用失败: {e}"}
+

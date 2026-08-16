@@ -38,6 +38,9 @@ def _load_dingtalk_config() -> Dict[str, str]:
             "webhook": str,      # Webhook URL（解密后）
             "secret": str,       # 签名密钥（解密后）
             "enabled": str,      # 是否启用
+            "quiet_start": str,  # 静默开始时间 HH:MM
+            "quiet_end": str,    # 静默结束时间 HH:MM
+            "base_url": str,     # 快捷链接基础地址
         }
     """
     db = SessionLocal()
@@ -45,18 +48,39 @@ def _load_dingtalk_config() -> Dict[str, str]:
         webhook = get_config_value(db, "dingtalk_webhook", "")
         secret = get_config_value(db, "dingtalk_secret", "")
         enabled = get_config_value(db, "dingtalk_enabled", "false")
+        quiet_start = get_config_value(db, "dingtalk_quiet_start", "")
+        quiet_end = get_config_value(db, "dingtalk_quiet_end", "")
+        base_url = get_config_value(db, "dingtalk_link_base", "http://localhost:8080")
         return {
             "webhook": webhook,
             "secret": secret,
             "enabled": enabled,
+            "quiet_start": quiet_start,
+            "quiet_end": quiet_end,
+            "base_url": base_url.rstrip("/"),
         }
     finally:
         db.close()
 
 
 def _is_enabled(config: Dict[str, str]) -> bool:
-    """检查钉钉是否启用"""
-    return config["enabled"].lower() in ("true", "1", "yes", "on")
+    """检查钉钉是否启用（含静默时段判断）"""
+    if config["enabled"].lower() not in ("true", "1", "yes", "on"):
+        return False
+
+    quiet_start = config.get("quiet_start", "")
+    quiet_end = config.get("quiet_end", "")
+    if quiet_start and quiet_end:
+        now = datetime.now().strftime("%H:%M")
+        if quiet_start <= quiet_end:
+            in_quiet = quiet_start <= now < quiet_end
+        else:
+            # 跨天静默，如 21:00 - 09:00
+            in_quiet = now >= quiet_start or now < quiet_end
+        if in_quiet:
+            logger.info(f"当前处于钉钉静默时段 {quiet_start}-{quiet_end}，跳过发送")
+            return False
+    return True
 
 
 # ======================================================================
@@ -253,14 +277,14 @@ async def notify_deploy_result(record: Any, host: Any = None) -> Dict[str, Any]:
             host_ip = getattr(host, "ip", "本地")
             host_name = getattr(host, "name", "本地主机")
 
-    # 状态映射
+    # 状态映射（含分类 emoji 标识）
     status_map = {
-        "success": ("部署成功", "success"),
-        "failed": ("部署失败", "error"),
-        "rolled_back": ("已回滚", "warning"),
-        "cancelled": ("已取消", "warning"),
+        "success": ("✅ 部署成功", "success"),
+        "failed": ("❌ 部署失败", "error"),
+        "rolled_back": ("⚠️ 已回滚", "warning"),
+        "cancelled": ("⚠️ 已取消", "warning"),
     }
-    status_text, level = status_map.get(status, (f"状态: {status}", "info"))
+    status_text, level = status_map.get(status, (f"ℹ️ 状态: {status}", "info"))
 
     # 构建时间信息
     time_str = ""
@@ -274,12 +298,19 @@ async def notify_deploy_result(record: Any, host: Any = None) -> Dict[str, Any]:
 
     duration_str = f"{duration:.1f}秒" if duration else "未知"
 
-    # 构建 Markdown 消息
+    # 构建 Markdown 消息（含快捷操作链接）
+    record_id = record.get("id") if isinstance(record, dict) else getattr(record, "id", None)
+    base_url = config.get("base_url", "http://localhost:8080")
+    links = []
+    if record_id:
+        links.append(f"[📋 查看详情]({base_url}/history?record_id={record_id})")
+        if status == "failed":
+            links.append(f"[🔄 重新部署]({base_url}/deploy)")
+
     title = f"[{status_text}] {project_name}"
     text = (
-        f"### 部署结果通知\n\n"
+        f"### {status_text}\n\n"
         f"**项目名称**: {project_name}\n\n"
-        f"**部署状态**: {status_text}\n\n"
         f"**目标主机**: {host_name} ({host_ip})\n\n"
         f"**操作人**: {operator}\n\n"
         f"**完成时间**: {time_str}\n\n"
@@ -290,6 +321,9 @@ async def notify_deploy_result(record: Any, host: Any = None) -> Dict[str, Any]:
         # 截断过长的错误信息
         display_error = error_message[:500] if len(error_message) > 500 else error_message
         text += f"**错误信息**:\n\n> {display_error}\n\n"
+
+    if links:
+        text += f"**快捷操作**: {' | '.join(links)}\n\n"
 
     text += f"---\n*由 MVP AI部署助手自动推送*"
 

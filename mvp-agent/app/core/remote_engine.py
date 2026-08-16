@@ -22,6 +22,7 @@ from app.core.base_engine import BaseDeployEngine, DeployContext
 from app.core.rollback import RollbackManager
 from app.core.ssh_client import SSHConnection
 from app.core.validator import Validator
+from app.utils.file_utils import file_md5
 from app.utils.logger import get_logger
 
 logger = get_logger("remote_engine")
@@ -144,32 +145,54 @@ class RemoteDeployEngine(BaseDeployEngine):
     # 传输
     # ------------------------------------------------------------------
     def transfer(self):
-        """SFTP 上传部署包"""
-        self.log("info", "开始上传部署包...", "transfer")
+        """SFTP 上传部署包（增量模式：MD5 比对跳过未变更文件）
+
+        临时目录按项目名持久化，跨多次部署复用，
+        内容一致的文件跳过传输以缩短部署时间。
+        """
+        self.log("info", "开始上传部署包（增量模式）...", "transfer")
 
         if not self.project_dir.exists():
             raise FileNotFoundError(f"项目目录不存在: {self.project_dir}")
 
-        # 创建远程临时目录
-        remote_tmp = f"/tmp/mvp-deploy-{self.context.record_id}"
+        # 创建远程临时目录（按项目持久化，供增量比对）
+        remote_tmp = f"/tmp/mvp-deploy/{self.project_name}"
         self.ssh_conn.execute(f"mkdir -p {remote_tmp}")
         self.context.extra["remote_tmp"] = remote_tmp
 
         # 上传文件
         sftp = self.ssh_conn.get_sftp()
         uploaded = []
+        skipped = 0
         try:
             for f in self.project_dir.iterdir():
-                if f.is_file():
-                    remote_path = f"{remote_tmp}/{f.name}"
+                if not f.is_file():
+                    continue
+                remote_path = f"{remote_tmp}/{f.name}"
+
+                # 增量比对：远程已存在相同内容则跳过传输
+                stdout, _, _ = self.ssh_conn.execute(
+                    f"md5sum {remote_path} 2>/dev/null | awk '{{print $1}}'"
+                )
+                remote_md5 = stdout.strip()
+                local_md5 = file_md5(str(f))
+                if local_md5 and remote_md5 == local_md5:
+                    skipped += 1
+                    self.log("info", f"未变更，跳过上传: {f.name}", "transfer")
+                else:
                     self.log("info", f"上传: {f.name} -> {remote_path}", "transfer")
                     sftp.put(str(f), remote_path)
-                    uploaded.append(f.name)
+
+                uploaded.append(f.name)
         finally:
             sftp.close()
 
         self.context.extra["uploaded_files"] = uploaded
-        self.log("success", f"上传完成: {len(uploaded)} 个文件", "transfer")
+        self.log(
+            "success",
+            f"上传完成: {len(uploaded)} 个文件（跳过 {skipped} 个未变更）",
+            "transfer",
+        )
 
     # ------------------------------------------------------------------
     # 安装
@@ -209,11 +232,13 @@ class RemoteDeployEngine(BaseDeployEngine):
                 self._default_install(backend_file, remote_tmp)
                 return
 
-            # JVM 参数根据 JDK 版本选择
-            if self.jdk_version == "17":
-                jvm_args = "-Xms256m -Xmx512m -XX:MetaspaceSize=128m -XX:MaxMetaspaceSize=256m"
-            else:
-                jvm_args = "-Xms256m -Xmx512m -XX:PermSize=128m -XX:MaxPermSize=256m"
+            # JVM 参数：优先使用环境模板/项目配置中的自定义值
+            jvm_args = (self.context.project_config or {}).get("jvm_args")
+            if not jvm_args:
+                if self.jdk_version == "17":
+                    jvm_args = "-Xms256m -Xmx512m -XX:MetaspaceSize=128m -XX:MaxMetaspaceSize=256m"
+                else:
+                    jvm_args = "-Xms256m -Xmx512m -XX:PermSize=128m -XX:MaxPermSize=256m"
 
             script = template.render(
                 jdk_version=self.jdk_version,
@@ -273,6 +298,47 @@ class RemoteDeployEngine(BaseDeployEngine):
             if exit_code != 0:
                 raise RuntimeError("解压前端包失败")
             self.log("success", f"前端包已解压到: {html_dir}", "install")
+
+        # 部署后自定义脚本（可选）
+        post_script = (self.context.project_config or {}).get("post_deploy_script")
+        if post_script:
+            self._run_post_deploy_script(post_script)
+
+    def _run_post_deploy_script(self, script: str):
+        """执行部署后自定义脚本
+
+        支持两种形式：
+        - 项目目录内的 .sh 脚本文件（先上传再执行）
+        - 直接的 Shell 命令字符串
+        """
+        import shlex
+
+        try:
+            script_file = self.project_dir / script
+            if script.endswith(".sh") and script_file.exists():
+                remote_script = f"{self.context.extra.get('remote_tmp', '/tmp')}/{script}"
+                sftp = self.ssh_conn.get_sftp()
+                try:
+                    sftp.put(str(script_file), remote_script)
+                finally:
+                    sftp.close()
+                self.ssh_conn.execute(f"chmod +x {remote_script}")
+                cmd = f"bash {remote_script}"
+            else:
+                cmd = f"bash -c {shlex.quote(script)}"
+
+            self.log("info", f"执行部署后脚本: {cmd}", "install")
+            output, exit_code = self.ssh_conn.exec_command_stream(
+                cmd,
+                callback=lambda data: self._stream_log(data, "install"),
+                timeout=300,
+            )
+            if exit_code != 0:
+                self.log("warn", f"部署后脚本退出码 {exit_code}", "install")
+            else:
+                self.log("success", "部署后脚本执行成功", "install")
+        except Exception as e:
+            self.log("warn", f"部署后脚本执行失败: {e}", "install")
 
     def _default_install(self, backend_file: str, remote_tmp: str):
         """默认安装方式（无模板时）"""

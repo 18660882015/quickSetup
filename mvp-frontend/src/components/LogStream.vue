@@ -7,7 +7,9 @@ import {
   DocumentCopy,
   Download,
   RefreshRight,
-  Connection
+  Connection,
+  Search,
+  WarningFilled
 } from '@element-plus/icons-vue'
 import { useWebSocket } from '@/composables/useWebSocket'
 
@@ -26,6 +28,13 @@ const LEVEL_COLORS = {
   error: '#F56C6C',
   success: '#67C23A',
   warning: '#E6A23C'
+}
+
+// 日志行背景高亮
+const LEVEL_BG = {
+  error: 'rgba(245, 108, 108, 0.12)',
+  warn: 'rgba(230, 162, 60, 0.10)',
+  success: 'rgba(103, 194, 58, 0.08)'
 }
 
 // 标准化日志级别
@@ -298,6 +307,44 @@ defineExpose({
 // 计算属性：日志总数
 const logCount = computed(() => logs.value.length)
 
+// ---- 智能日志分析 ----
+const searchKeyword = ref('')
+const showOnlyErrors = ref(false)
+
+// 错误摘要（自动提取 ERROR 行，最多 20 条）
+const errorSummary = computed(() => {
+  return logs.value
+    .filter((l) => l.level === 'error')
+    .slice(-20)
+})
+
+const errorCount = computed(() => logs.value.filter((l) => l.level === 'error').length)
+const warnCount = computed(() => logs.value.filter((l) => l.level === 'warn' || l.level === 'warning').length)
+
+// 过滤后的日志
+const filteredLogs = computed(() => {
+  let result = logs.value
+  if (showOnlyErrors.value) {
+    result = result.filter((l) => l.level === 'error' || l.level === 'warn')
+  }
+  if (searchKeyword.value.trim()) {
+    const kw = searchKeyword.value.trim().toLowerCase()
+    result = result.filter(
+      (l) => l.message.toLowerCase().includes(kw) || (l.step || '').toLowerCase().includes(kw)
+    )
+  }
+  return result
+})
+
+// 关键词高亮
+function highlightText(text) {
+  if (!searchKeyword.value.trim()) return text
+  const kw = searchKeyword.value.trim()
+  const safeKw = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return text.replace(new RegExp(safeKw, 'gi'), (match) => `<mark>${match}</mark>`)
+}
+
+
 // 计算属性：WebSocket 状态文本
 const wsStatusText = computed(() => {
   const map = {
@@ -381,28 +428,58 @@ function formatTimestamp(ts) {
         <el-button size="small" :icon="DocumentCopy" @click="copyLogs">复制</el-button>
         <el-button size="small" :icon="Download" @click="downloadLogs">下载</el-button>
         <el-button size="small" :icon="RefreshRight" @click="clearLogs">清空</el-button>
+        <el-button
+          size="small"
+          :type="showOnlyErrors ? 'danger' : 'default'"
+          @click="showOnlyErrors = !showOnlyErrors"
+        >
+          只看异常
+        </el-button>
       </div>
       <div class="toolbar-right">
-        <span class="log-count">共 {{ logCount }} 条日志</span>
+        <el-input
+          v-model="searchKeyword"
+          size="small"
+          placeholder="搜索日志..."
+          :prefix-icon="Search"
+          clearable
+          class="search-input"
+        />
+        <span v-if="errorCount > 0" class="error-badge">错误 {{ errorCount }}</span>
+        <span v-if="warnCount > 0" class="warn-badge">警告 {{ warnCount }}</span>
+        <span class="log-count">共 {{ logCount }} 条</span>
+      </div>
+    </div>
+
+    <!-- 错误摘要 -->
+    <div v-if="errorSummary.length > 0" class="error-summary">
+      <div class="summary-header">
+        <el-icon color="#F56C6C"><WarningFilled /></el-icon>
+        <span>错误摘要（自动提取，最近 {{ errorSummary.length }} 条）</span>
+      </div>
+      <div v-for="(err, idx) in errorSummary" :key="idx" class="summary-line">
+        <span class="summary-time">{{ formatTimestamp(err.timestamp) }}</span>
+        <span class="summary-msg">{{ err.message }}</span>
       </div>
     </div>
 
     <!-- 日志正文 -->
     <div ref="logBodyRef" class="log-body">
-      <div v-if="logs.length === 0" class="log-empty">
+      <div v-if="filteredLogs.length === 0" class="log-empty">
         <el-icon :size="32" color="#909399"><Connection /></el-icon>
-        <p>{{ deployId ? '等待日志输出...' : '尚未开始部署，无日志' }}</p>
+        <p>{{ logs.length > 0 ? '没有匹配的日志' : deployId ? '等待日志输出...' : '尚未开始部署，无日志' }}</p>
       </div>
       <div
-        v-for="(log, idx) in logs"
+        v-for="(log, idx) in filteredLogs"
         :key="idx"
         class="log-line"
-        :style="{ color: LEVEL_COLORS[log.level] || '#909399' }"
+        :class="`log-line-${log.level}`"
+        :style="{ color: LEVEL_COLORS[log.level] || '#909399', background: LEVEL_BG[log.level] || 'transparent' }"
       >
         <span class="log-time">[{{ formatTimestamp(log.timestamp) }}]</span>
         <span class="log-level">[{{ log.level.toUpperCase() }}]</span>
         <span class="log-step" v-if="log.step">[{{ log.step }}]</span>
-        <span class="log-message">{{ log.message }}</span>
+        <span class="log-message" v-html="highlightText(log.message)"></span>
       </div>
     </div>
 
@@ -527,6 +604,87 @@ function formatTimestamp(ts) {
 .toolbar-right {
   font-size: 12px;
   color: #909399;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.search-input {
+  width: 160px;
+}
+
+.error-badge {
+  color: #f56c6c;
+  font-weight: 600;
+  padding: 1px 8px;
+  border: 1px solid #f56c6c;
+  border-radius: 10px;
+  font-size: 11px;
+}
+
+.warn-badge {
+  color: #e6a23c;
+  font-weight: 600;
+  padding: 1px 8px;
+  border: 1px solid #e6a23c;
+  border-radius: 10px;
+  font-size: 11px;
+}
+
+/* 错误摘要 */
+.error-summary {
+  background-color: #fef0f0;
+  border: 1px solid #fbc4c4;
+  border-left: 3px solid #f56c6c;
+  border-radius: 4px;
+  padding: 10px 14px;
+  margin: 0;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.summary-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #f56c6c;
+  margin-bottom: 8px;
+}
+
+.summary-line {
+  display: flex;
+  gap: 10px;
+  font-size: 12px;
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  color: #c45656;
+  padding: 2px 0;
+  word-break: break-all;
+}
+
+.summary-time {
+  opacity: 0.7;
+  flex-shrink: 0;
+}
+
+.summary-msg {
+  flex: 1;
+}
+
+:deep(mark) {
+  background-color: #e6a23c;
+  color: #1e1e1e;
+  border-radius: 2px;
+  padding: 0 2px;
+}
+
+.log-line-error {
+  border-left: 2px solid #f56c6c;
+}
+
+.log-line-warn {
+  border-left: 2px solid #e6a23c;
 }
 
 .log-count {

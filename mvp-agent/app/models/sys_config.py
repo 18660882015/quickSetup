@@ -34,21 +34,36 @@ SEED_CONFIGS: List[tuple] = [
     ("deepseek_api_key", "", True, "DeepSeek API Key"),
     ("deepseek_base_url", "https://api.deepseek.com", False, "DeepSeek API 地址"),
     ("deepseek_model", "deepseek-chat", False, "DeepSeek 模型名称"),
+    ("ai_provider", "deepseek", False, "AI 提供商: deepseek / ollama"),
+    ("ollama_base_url", "http://localhost:11434", False, "Ollama 本地服务地址"),
+    ("ollama_model", "qwen2.5:7b", False, "Ollama 本地模型名称"),
 
     # 钉钉相关
     ("dingtalk_webhook", "", True, "钉钉机器人 Webhook URL"),
     ("dingtalk_secret", "", True, "钉钉机器人签名密钥"),
     ("dingtalk_enabled", "false", False, "是否启用钉钉通知"),
+    ("dingtalk_quiet_start", "", False, "钉钉静默开始时间 HH:MM（空为不静默）"),
+    ("dingtalk_quiet_end", "", False, "钉钉静默结束时间 HH:MM"),
+    ("dingtalk_link_base", "http://localhost:8080", False, "告警消息快捷链接基础地址"),
 
     # 监控相关
     ("monitor_time", "02:00", False, "每日监控报告时间"),
     ("cpu_threshold", "80", False, "CPU 告警阈值(%)"),
     ("memory_threshold", "80", False, "内存告警阈值(%)"),
     ("disk_threshold", "90", False, "磁盘告警阈值(%)"),
+    ("disk_cleanup_enabled", "true", False, "是否启用磁盘自动清理"),
+    ("log_retention_days", "30", False, "日志保留天数"),
+
+    # 进程守护相关
+    ("guard_enabled", "true", False, "是否启用进程守护"),
+    ("guard_interval_seconds", "30", False, "进程守护检查间隔(秒)"),
+    ("guard_max_restart", "3", False, "进程守护最大重启次数"),
 
     # 部署相关
     ("backup_max_count", "5", False, "最大保留备份数量"),
     ("deploy_timeout", "300", False, "部署超时时间(秒)"),
+    ("db_backup_enabled", "true", False, "是否启用数据库自动备份"),
+    ("db_backup_keep_days", "7", False, "数据库备份保留天数"),
 ]
 
 

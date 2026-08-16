@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, computed, nextTick } from 'vue'
+import { ref, reactive, computed, nextTick, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Monitor,
@@ -16,9 +16,19 @@ import {
   WarningFilled,
   Link,
   Loading,
-  Connection
+  Connection,
+  MagicStick,
+  Files
 } from '@element-plus/icons-vue'
-import { getPlan, executeDeploy, rollbackDeploy } from '@/api/deploy'
+import {
+  getPlan,
+  executeDeploy,
+  rollbackDeploy,
+  quickDeploy,
+  batchDeploy,
+  getEnvTemplates
+} from '@/api/deploy'
+import { scanProjects } from '@/api/file'
 import HostSelector from '@/components/HostSelector.vue'
 import FileSelector from '@/components/FileSelector.vue'
 import LogStream from '@/components/LogStream.vue'
@@ -45,6 +55,7 @@ const wizard = reactive({
     execute_mode: 'auto',
     nginx_port: 80,
     tomcat_port: 8080,
+    post_deploy_script: '',
     showAdvanced: false
   },
   // 步骤四
@@ -57,11 +68,43 @@ const wizard = reactive({
   deployResult: null // { status, accessUrl, validationResults, error }
 })
 
+// ---- 环境模板 / 批量部署状态 ----
+const envTemplates = ref([])
+const batchMode = ref(false)
+const allProjects = ref([])
+const batchProjects = ref([])
+const batchStarting = ref(false)
+const quickStarting = ref(false)
+
+onMounted(async () => {
+  const [tplRes, projRes] = await Promise.allSettled([
+    getEnvTemplates(),
+    scanProjects()
+  ])
+  if (tplRes.status === 'fulfilled') envTemplates.value = tplRes.value.data || []
+  if (projRes.status === 'fulfilled') {
+    allProjects.value = (projRes.value.data || []).map((p) => p.name)
+  }
+})
+
 // ---- 选项 ----
-const envOptions = [
-  { label: '开发环境 (dev)', value: 'dev' },
-  { label: '生产环境 (prod)', value: 'prod' }
-]
+const envOptions = computed(() => {
+  if (envTemplates.value.length > 0) {
+    return envTemplates.value.map((t) => ({
+      label: `${t.label || t.name} (${t.name})`,
+      value: t.name
+    }))
+  }
+  return [
+    { label: '开发环境 (dev)', value: 'dev' },
+    { label: '生产环境 (prod)', value: 'prod' }
+  ]
+})
+
+// 当前环境对应的模板（用于展示推荐参数）
+const currentTemplate = computed(() =>
+  envTemplates.value.find((t) => t.name === wizard.config.env_type)
+)
 
 const jdkOptions = [
   { label: 'JDK 8', value: '8' },
@@ -209,6 +252,76 @@ function handleProjectChange(project) {
   }
 }
 
+// ---- 一键快速部署（智能识别配置） ----
+async function handleQuickDeploy() {
+  if (!wizard.projectName) return
+  try {
+    await ElMessageBox.confirm(
+      `将使用智能识别的推荐配置直接部署「${wizard.projectName}」，是否继续？`,
+      '一键部署',
+      { confirmButtonText: '开始部署', cancelButtonText: '取消', type: 'info' }
+    )
+  } catch (e) {
+    return
+  }
+
+  quickStarting.value = true
+  try {
+    const res = await quickDeploy({
+      project_name: wizard.projectName,
+      is_local: wizard.deployMode === 'local',
+      host_id: wizard.deployMode === 'remote' ? wizard.hostId : null,
+      env_type: wizard.config.env_type
+    })
+    wizard.deployId = String(res.data.task_id || '')
+    wizard.recordId = res.data.task_id
+    wizard.deployResult = null
+    wizard.executing = true
+    wizard.activeStep = 4
+    ElMessage.success('快速部署已启动（智能配置）')
+  } catch (e) {
+    // 错误由拦截器处理
+  } finally {
+    quickStarting.value = false
+  }
+}
+
+// ---- 批量部署 ----
+async function handleBatchDeploy() {
+  if (!batchProjects.value.length) {
+    ElMessage.warning('请至少选择一个项目')
+    return
+  }
+  const target = wizard.deployMode === 'local' ? '本地' : '所选主机'
+  try {
+    await ElMessageBox.confirm(
+      `将按顺序部署 ${batchProjects.value.length} 个项目到${target}，是否继续？`,
+      '批量部署',
+      { confirmButtonText: '开始批量部署', cancelButtonText: '取消', type: 'info' }
+    )
+  } catch (e) {
+    return
+  }
+
+  batchStarting.value = true
+  try {
+    const items = batchProjects.value.map((name) => ({
+      project_name: name,
+      is_local: wizard.deployMode === 'local',
+      host_id: wizard.deployMode === 'remote' ? wizard.hostId : null,
+      env_type: wizard.config.env_type
+    }))
+    await batchDeploy({ items })
+    ElMessage.success('批量部署已启动，可在部署历史中查看进度')
+    batchMode.value = false
+    batchProjects.value = []
+  } catch (e) {
+    // 错误由拦截器处理
+  } finally {
+    batchStarting.value = false
+  }
+}
+
 // ---- 生成部署计划 ----
 async function generatePlan() {
   wizard.planLoading = true
@@ -297,7 +410,8 @@ async function doStartDeploy() {
       execute_mode: wizard.config.execute_mode,
       is_local: wizard.deployMode === 'local',
       nginx_port: wizard.config.nginx_port,
-      tomcat_port: wizard.config.tomcat_port
+      tomcat_port: wizard.config.tomcat_port,
+      post_deploy_script: wizard.config.post_deploy_script || null
     }
     const res = await executeDeploy(payload)
     const data = res.data || {}
@@ -391,6 +505,7 @@ function handleRestart() {
     execute_mode: 'auto',
     nginx_port: 80,
     tomcat_port: 8080,
+    post_deploy_script: '',
     showAdvanced: false
   }
 }
@@ -471,11 +586,63 @@ const isRolledBack = computed(() => wizard.deployResult?.status === 'rolled_back
         <div class="step-header">
           <el-icon :size="24" color="#409EFF"><Folder /></el-icon>
           <h3>选择部署项目</h3>
+          <div class="step-header-actions">
+            <el-button
+              type="success"
+              size="small"
+              :icon="MagicStick"
+              :disabled="!wizard.projectName || batchMode"
+              :loading="quickStarting"
+              @click="handleQuickDeploy"
+            >
+              一键部署（智能配置）
+            </el-button>
+            <el-button
+              size="small"
+              :icon="Files"
+              :type="batchMode ? 'warning' : 'default'"
+              @click="batchMode = !batchMode; batchProjects = []"
+            >
+              {{ batchMode ? '退出批量模式' : '批量部署' }}
+            </el-button>
+          </div>
         </div>
         <FileSelector
+          v-show="!batchMode"
           v-model="wizard.projectName"
           @change="handleProjectChange"
         />
+
+        <!-- 批量部署模式 -->
+        <div v-if="batchMode" class="batch-section">
+          <el-alert
+            type="info"
+            :closable="false"
+            show-icon
+            title="批量模式：多个项目将按选择顺序依次部署到当前所选目标（步骤一的模式/主机）"
+            class="batch-alert"
+          />
+          <el-select
+            v-model="batchProjects"
+            multiple
+            filterable
+            placeholder="选择要批量部署的项目（按选择顺序执行）"
+            style="width: 100%"
+          >
+            <el-option v-for="name in allProjects" :key="name" :label="name" :value="name" />
+          </el-select>
+          <div class="batch-actions">
+            <el-button
+              type="primary"
+              :icon="VideoPlay"
+              :disabled="!batchProjects.length"
+              :loading="batchStarting"
+              @click="handleBatchDeploy"
+            >
+              开始批量部署（{{ batchProjects.length }} 项）
+            </el-button>
+          </div>
+        </div>
       </div>
 
       <!-- 步骤三：配置部署参数 -->
@@ -485,6 +652,25 @@ const isRolledBack = computed(() => wizard.deployResult?.status === 'rolled_back
           <h3>配置部署参数</h3>
         </div>
         <el-form :model="wizard.config" label-width="120px" label-position="right" class="config-form">
+          <!-- 环境模板提示 -->
+          <el-alert
+            v-if="currentTemplate"
+            type="info"
+            :closable="false"
+            class="tpl-alert"
+          >
+            <template #title>
+              环境模板「{{ currentTemplate.label }}」：{{ currentTemplate.description }}
+            </template>
+            <div v-if="currentTemplate.jvm_args" class="tpl-detail">
+              JVM: {{ currentTemplate.jvm_args }}
+            </div>
+            <div v-if="currentTemplate.log_level" class="tpl-detail">
+              日志级别: {{ currentTemplate.log_level }} ·
+              Nginx workers: {{ currentTemplate.nginx?.worker_processes ?? '-' }} ·
+              MySQL max_connections: {{ currentTemplate.mysql?.max_connections ?? '-' }}
+            </div>
+          </el-alert>
           <el-row :gutter="20">
             <el-col :span="12">
               <el-form-item label="环境类型">
@@ -562,6 +748,17 @@ const isRolledBack = computed(() => wizard.deployResult?.status === 'rolled_back
                     :max="65535"
                     controls-position="right"
                     style="width: 100%"
+                  />
+                </el-form-item>
+              </el-col>
+            </el-row>
+            <el-row :gutter="20">
+              <el-col :span="24">
+                <el-form-item label="部署后脚本">
+                  <el-input
+                    v-model="wizard.config.post_deploy_script"
+                    placeholder="如 post_deploy.sh（项目目录内脚本）或 curl http://xx 刷新CDN，可留空"
+                    clearable
                   />
                 </el-form-item>
               </el-col>
@@ -784,6 +981,35 @@ const isRolledBack = computed(() => wizard.deployResult?.status === 'rolled_back
   margin: 0;
   font-size: 18px;
   color: #303133;
+}
+
+.step-header-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+/* 批量部署 */
+.batch-section {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.batch-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* 环境模板提示 */
+.tpl-alert {
+  margin-bottom: 16px;
+}
+
+.tpl-detail {
+  font-size: 12px;
+  color: #606266;
+  line-height: 1.6;
 }
 
 .danger-tag {

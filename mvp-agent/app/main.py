@@ -87,6 +87,77 @@ async def _job_daily_report():
         logger.error(f"每日监控报告任务异常: {e}", exc_info=True)
 
 
+async def _job_service_guard():
+    """定时任务：进程守护检查（默认每 30 秒，间隔可配置）
+
+    检查所有启用的守护项，服务停止时自动重启并推送钉钉。
+    """
+    from app.services.guard_service import run_guard_check
+    from app.models.database import SessionLocal
+    from app.models.sys_config import get_config_value
+
+    try:
+        db = SessionLocal()
+        try:
+            if get_config_value(db, "guard_enabled", "true").lower() not in ("true", "1", "yes", "on"):
+                return
+        finally:
+            db.close()
+
+        stats = await run_guard_check()
+        if stats.get("total", 0) > 0 and (stats.get("restarted", 0) > 0 or stats.get("failed", 0) > 0):
+            logger.info(
+                f"进程守护检查: 守护 {stats['total']} 项, "
+                f"运行 {stats['running']}, 重启 {stats['restarted']}, 异常 {stats['failed']}"
+            )
+    except Exception as e:
+        logger.error(f"进程守护任务异常: {e}", exc_info=True)
+
+
+def _job_db_backup():
+    """定时任务：数据库自动备份（每天 02:30，保留 N 天）"""
+    from app.services.backup_service import backup_database
+    from app.models.database import SessionLocal
+    from app.models.sys_config import get_config_value
+
+    try:
+        db = SessionLocal()
+        try:
+            if get_config_value(db, "db_backup_enabled", "true").lower() not in ("true", "1", "yes", "on"):
+                return
+        finally:
+            db.close()
+
+        result = backup_database(reason="auto")
+        if result["success"]:
+            logger.info(f"数据库自动备份完成: {result['file']}")
+        else:
+            logger.warning(f"数据库自动备份失败: {result['message']}")
+    except Exception as e:
+        logger.error(f"数据库备份任务异常: {e}", exc_info=True)
+
+
+def _job_disk_cleanup():
+    """定时任务：磁盘空间清理（每天 03:00）"""
+    from app.services.backup_service import cleanup_disk
+    from app.models.database import SessionLocal
+    from app.models.sys_config import get_config_value
+
+    try:
+        db = SessionLocal()
+        try:
+            if get_config_value(db, "disk_cleanup_enabled", "true").lower() not in ("true", "1", "yes", "on"):
+                return
+        finally:
+            db.close()
+
+        result = cleanup_disk()
+        if result.get("removed") and any(result["removed"].values()):
+            logger.info(f"磁盘清理完成: {result['message']}")
+    except Exception as e:
+        logger.error(f"磁盘清理任务异常: {e}", exc_info=True)
+
+
 def _get_monitor_cron_time():
     """从 sys_configs 读取每日监控报告时间，转换为 cron 参数
 
@@ -201,11 +272,46 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
         )
 
+        # e. 进程守护检查（默认每 30 秒）
+        scheduler.add_job(
+            _job_service_guard,
+            trigger="interval",
+            seconds=30,
+            id="service_guard",
+            name="进程守护检查",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+
+        # f. 数据库自动备份（每天 02:30）
+        scheduler.add_job(
+            _job_db_backup,
+            trigger="cron",
+            hour=2,
+            minute=30,
+            id="db_backup",
+            name="数据库自动备份",
+            replace_existing=True,
+        )
+
+        # g. 磁盘空间清理（每天 03:00）
+        scheduler.add_job(
+            _job_disk_cleanup,
+            trigger="cron",
+            hour=3,
+            minute=0,
+            id="disk_cleanup",
+            name="磁盘空间清理",
+            replace_existing=True,
+        )
+
         scheduler.start()
         logger.info(
             f"APScheduler 已启动，注册定时任务: "
             f"SSH清理(30min), 主机检查(5min), 监控采集(1h), "
-            f"日报({cron_params['hour']:02d}:{cron_params['minute']:02d})"
+            f"日报({cron_params['hour']:02d}:{cron_params['minute']:02d}), "
+            f"进程守护(30s), 数据库备份(02:30), 磁盘清理(03:00)"
         )
     except Exception as e:
         logger.warning(f"APScheduler 启动失败（非致命）: {e}")

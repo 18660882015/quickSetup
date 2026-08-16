@@ -78,7 +78,7 @@ def get_db_context():
 def init_database():
     """初始化数据库：建表 + 插入种子数据"""
     # 导入所有模型，确保表被注册
-    from app.models import host, deploy_record, monitor_daily, sys_config  # noqa: F401
+    from app.models import host, deploy_record, monitor_daily, sys_config, service_guard  # noqa: F401
 
     # 创建所有表
     Base.metadata.create_all(bind=engine)

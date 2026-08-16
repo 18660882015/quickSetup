@@ -49,6 +49,32 @@ def scan(
     return success(data=projects)
 
 
+@router.get("/detect", response_model=ApiResponse, summary="智能识别所有项目")
+def detect_all(
+    _: dict = Depends(get_current_user),
+):
+    """扫描并智能识别所有项目类型（Maven/Node/Jar/War/前端）"""
+    from app.services.project_detector import detect_all_projects
+    projects = detect_all_projects()
+    return success(data=projects)
+
+
+@router.get("/detect/{project}", response_model=ApiResponse, summary="识别单个项目")
+def detect_one(
+    project: str,
+    _: dict = Depends(get_current_user),
+):
+    """智能识别指定项目，返回推荐配置"""
+    target = DEPLOYMENTS_DIR / project
+    if not target.exists():
+        raise HTTPException(status_code=404, detail=f"项目目录不存在: {project}")
+
+    from app.services.project_detector import detect_project
+    info = detect_project(target)
+    info["dir_name"] = project
+    return success(data=info)
+
+
 @router.get("/list", response_model=ApiResponse, summary="列出项目下文件")
 def list_files(
     project: Optional[str] = None,

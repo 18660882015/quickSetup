@@ -22,3 +22,13 @@ export function uploadFile(formData) {
 export function deleteFile(path) {
   return service.delete(`/files/${encodeURIComponent(path)}`)
 }
+
+// 智能识别所有项目
+export function detectAllProjects() {
+  return service.get('/files/detect')
+}
+
+// 智能识别单个项目（返回推荐配置）
+export function detectProject(project) {
+  return service.get(`/files/detect/${encodeURIComponent(project)}`)
+}

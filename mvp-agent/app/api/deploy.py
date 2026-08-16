@@ -33,10 +33,12 @@ from app.models.deploy_record import DeployRecord
 from app.models.host import Host
 from app.schemas.common import ApiResponse, success
 from app.schemas.deploy import (
+    BatchDeployRequest,
     DeployExecuteRequest,
     DeployPlanRequest,
     DeployPlanResponse,
     DeployRecordResponse,
+    QuickDeployRequest,
 )
 from app.services.ai_service import generate_deploy_plan, analyze_error
 from app.services.dingtalk_service import notify_deploy_result
@@ -102,11 +104,11 @@ def _load_project_config(project_name: str, request_config: dict) -> dict:
         "project_dir": str(project_dir),
     }
 
-    # 从 project.json 加载
+    # 从 project.json 加载（utf-8-sig 兼容带 BOM 的 Windows 文件）
     project_json_path = project_dir / "project.json"
     if project_json_path.exists():
         try:
-            with open(project_json_path, "r", encoding="utf-8") as f:
+            with open(project_json_path, "r", encoding="utf-8-sig") as f:
                 json_config = json.load(f)
             config.update(json_config)
         except Exception as e:
@@ -114,6 +116,13 @@ def _load_project_config(project_name: str, request_config: dict) -> dict:
 
     # 请求参数覆盖
     config.update(request_config)
+
+    # 多环境配置模板：按 env_type 合并 JVM/Nginx/MySQL/日志级别参数
+    # （显式传入的配置已在上面覆盖，不会被模板改写）
+    from app.services.env_template import apply_template_to_config
+
+    apply_template_to_config(config.get("env_type"), config)
+
     return config
 
 
@@ -211,22 +220,15 @@ async def generate_plan(
 # ======================================================================
 # 执行部署
 # ======================================================================
-@router.post("/execute", response_model=ApiResponse, summary="执行部署")
-async def execute_deploy(
+def _launch_deploy(
     request: DeployExecuteRequest,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    """启动部署任务
+    db: Session,
+    current_user: dict,
+    loop,
+) -> int:
+    """校验并启动单个部署任务（后台线程执行），返回 task_id
 
-    流程：
-    1. 检查部署锁（同一主机不允许并发部署）
-    2. 创建部署记录
-    3. 获取事件循环（用于跨线程推送日志）
-    4. 创建日志回调（asyncio.run_coroutine_threadsafe 桥接）
-    5. 选择执行器（LocalDeployExecutor 或 RemoteDeployExecutor）
-    6. 后台线程执行部署
-    7. 部署完成后更新数据库状态
+    供 /execute、/quick、/batch 复用；校验失败抛 HTTPException。
     """
     # 1. 检查部署锁
     if request.host_id:
@@ -275,9 +277,6 @@ async def execute_deploy(
         f"创建部署任务: id={task_id}, project={request.project_name}"
     )
 
-    # 4. 获取事件循环
-    loop = asyncio.get_running_loop()
-
     # 5. 创建日志回调（线程安全，通过 asyncio.run_coroutine_threadsafe 桥接）
     def log_callback(level: str, message: str, step: Optional[str] = None):
         asyncio.run_coroutine_threadsafe(
@@ -287,8 +286,6 @@ async def execute_deploy(
 
     # 6. 确认回调（P1 阶段自动确认）
     def confirm_callback(step: str, command: str, is_dangerous: bool) -> bool:
-        # P1: 自动确认所有操作
-        # P2/P3: 可通过 WebSocket 弹窗让用户确认
         if is_dangerous:
             logger.warning(
                 f"[task={task_id}] 危险操作自动确认: step={step}, command={command}"
@@ -302,6 +299,7 @@ async def execute_deploy(
         "db_name": request.db_name,
         "deploy_dir": request.deploy_dir,
         "version": request.version,
+        "post_deploy_script": request.post_deploy_script,
     }
     project_config = _load_project_config(request.project_name, request_config)
     deploy_config = {
@@ -541,9 +539,182 @@ async def execute_deploy(
     thread = threading.Thread(target=run_deploy, daemon=True)
     thread.start()
 
+    return task_id
+
+
+@router.post("/execute", response_model=ApiResponse, summary="执行部署")
+async def execute_deploy(
+    request: DeployExecuteRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """启动部署任务（后台线程执行）"""
+    loop = asyncio.get_running_loop()
+    task_id = _launch_deploy(request, db, current_user, loop)
     return success(
         data={"task_id": task_id, "status": "pending"},
         msg="部署任务已创建，正在后台执行",
+    )
+
+
+# ======================================================================
+# 极简快速部署
+# ======================================================================
+@router.post("/quick", response_model=ApiResponse, summary="快速部署（智能配置）")
+async def quick_deploy(
+    request: QuickDeployRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """极简快速部署：智能识别项目 -> 自动填充配置 -> 直接执行
+
+    - JDK 版本：项目识别值 > 主机配置 > 默认 8
+    - 数据库名：识别值 > 项目名推断
+    """
+    from app.services.project_detector import detect_project
+
+    project_dir = DEPLOYMENTS_DIR / request.project_name
+    if not project_dir.exists():
+        raise HTTPException(
+            status_code=404, detail=f"项目目录不存在: {request.project_name}"
+        )
+
+    detected = detect_project(project_dir)
+
+    # project.json 中的显式配置优先于识别推断值
+    project_json = {}
+    project_json_path = project_dir / "project.json"
+    if project_json_path.exists():
+        try:
+            with open(project_json_path, "r", encoding="utf-8-sig") as f:
+                project_json = json.load(f)
+        except Exception:
+            project_json = {}
+
+    jdk_version = str(
+        detected.get("jdk_version") or project_json.get("jdk_version") or "8"
+    )
+    if request.host_id:
+        host = db.query(Host).filter(Host.id == request.host_id).first()
+        if not host:
+            raise HTTPException(status_code=404, detail="主机不存在")
+        if (
+            detected.get("jdk_version") is None
+            and not project_json.get("jdk_version")
+            and host.jdk_version
+        ):
+            jdk_version = str(host.jdk_version)
+
+    db_name = (
+        detected.get("db_name")
+        or project_json.get("db_name")
+        or request.project_name.replace("-", "_").replace(" ", "_").lower()
+    )
+
+    exec_request = DeployExecuteRequest(
+        project_name=request.project_name,
+        host_id=request.host_id,
+        is_local=request.is_local,
+        env_type=request.env_type,
+        jdk_version=jdk_version,
+        db_name=db_name,
+    )
+
+    loop = asyncio.get_running_loop()
+    task_id = _launch_deploy(exec_request, db, current_user, loop)
+
+    return success(
+        data={"task_id": task_id, "detected": detected},
+        msg="快速部署已启动（智能配置）",
+    )
+
+
+# ======================================================================
+# 批量部署
+# ======================================================================
+_TERMINAL_STATUS = {"success", "failed", "cancelled", "rolled_back"}
+
+
+def _wait_task_terminal(task_id: int, timeout: int = 3600) -> str:
+    """轮询部署记录直到进入终态（供批量部署串行等待）"""
+    import time as _time
+
+    deadline = _time.time() + timeout
+    while _time.time() < deadline:
+        db = SessionLocal()
+        try:
+            rec = db.query(DeployRecord).filter(DeployRecord.id == task_id).first()
+            if rec and rec.execute_status in _TERMINAL_STATUS:
+                return rec.execute_status
+        finally:
+            db.close()
+        _time.sleep(2)
+    return "timeout"
+
+
+@router.post("/batch", response_model=ApiResponse, summary="批量部署")
+async def batch_deploy(
+    request: BatchDeployRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """批量部署：多个项目按提交顺序依次执行
+
+    同一主机的任务串行等待完成后再启动下一项，避免部署锁冲突；
+    执行结果可通过部署历史查询。
+    """
+    # 预校验项目目录
+    missing = [
+        i.project_name
+        for i in request.items
+        if not (DEPLOYMENTS_DIR / i.project_name).exists()
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=400, detail=f"项目目录不存在: {', '.join(missing)}"
+        )
+
+    loop = asyncio.get_running_loop()
+    username = current_user.get("username", "admin")
+    items = [i.model_dump() for i in request.items]
+
+    def run_batch():
+        results = []
+        for idx, item in enumerate(items, 1):
+            name = item["project_name"]
+            logger.info(f"[batch {idx}/{len(items)}] 开始部署: {name}")
+            item_db = SessionLocal()
+            try:
+                exec_request = DeployExecuteRequest(**item)
+                task_id = _launch_deploy(
+                    exec_request, item_db, {"username": username}, loop
+                )
+            except HTTPException as e:
+                results.append(
+                    {"project_name": name, "status": "failed", "error": str(e.detail)}
+                )
+                logger.warning(f"[batch {idx}/{len(items)}] 启动失败: {name} - {e.detail}")
+                continue
+            finally:
+                item_db.close()
+
+            status = _wait_task_terminal(task_id)
+            results.append(
+                {"task_id": task_id, "project_name": name, "status": status}
+            )
+            logger.info(f"[batch {idx}/{len(items)}] 完成: {name} -> {status}")
+
+        ok = sum(1 for r in results if r.get("status") == "success")
+        logger.info(
+            f"批量部署完成: 共 {len(results)} 项，成功 {ok}，"
+            f"失败 {len(results) - ok}"
+        )
+
+    threading.Thread(target=run_batch, daemon=True).start()
+
+    return success(
+        msg=f"批量部署已启动（{len(items)} 项，按顺序执行）",
+        data={"total": len(items)},
     )
 
 

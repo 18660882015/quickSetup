@@ -24,7 +24,7 @@ from app.config.settings import DEPLOYMENTS_DIR
 from app.core.base_engine import BaseDeployEngine, DeployContext
 from app.core.rollback import RollbackManager
 from app.core.validator import Validator
-from app.utils.file_utils import copy_file, ensure_dir, extract_zip
+from app.utils.file_utils import copy_file, ensure_dir, extract_zip, files_identical, get_file_size_str
 from app.utils.logger import get_logger
 
 logger = get_logger("local_engine")
@@ -183,18 +183,25 @@ class LocalDeployEngine(BaseDeployEngine):
     # 安装
     # ------------------------------------------------------------------
     def install(self):
-        """安装部署文件"""
+        """安装部署文件（增量模式：MD5 比对跳过未变更文件）"""
         self.log("info", "开始安装...", "install")
 
-        # 安装后端
+        # 安装后端（增量比对）
         backend_file = self.context.extra.get("backend_file")
         if backend_file:
             ensure_dir(self.tomcat_webapps_dir)
             dst = os.path.join(
                 self.tomcat_webapps_dir, os.path.basename(backend_file)
             )
-            if copy_file(backend_file, dst):
-                self.log("info", f"后端包已复制到: {dst}", "install")
+            if os.path.exists(dst) and files_identical(backend_file, dst):
+                self.log(
+                    "info",
+                    f"后端包未变更，跳过复制（增量模式）: {os.path.basename(backend_file)}",
+                    "install",
+                )
+            elif copy_file(backend_file, dst):
+                size_str = get_file_size_str(os.path.getsize(backend_file))
+                self.log("info", f"后端包已复制到: {dst} ({size_str})", "install")
             else:
                 raise RuntimeError(f"复制后端包失败: {backend_file}")
 
@@ -209,6 +216,32 @@ class LocalDeployEngine(BaseDeployEngine):
             else:
                 raise RuntimeError(f"解压前端包失败: {frontend_zip}")
 
+        # 部署后自定义脚本（可选）
+        post_script = (self.context.project_config or {}).get("post_deploy_script")
+        if post_script:
+            self._run_post_deploy_script(post_script)
+
+    def _run_post_deploy_script(self, script: str):
+        """执行部署后自定义脚本（本地 cmd）"""
+        self.log("info", f"执行部署后脚本: {script}", "install")
+        try:
+            proc = subprocess.run(
+                script, shell=True, capture_output=True, text=True, timeout=300
+            )
+            if proc.returncode != 0:
+                self.log(
+                    "warn",
+                    f"部署后脚本退出码 {proc.returncode}: {proc.stderr[:300]}",
+                    "install",
+                )
+            else:
+                output = (proc.stdout or "").strip()
+                if output:
+                    self.log("info", f"脚本输出: {output[:300]}", "install")
+                self.log("success", "部署后脚本执行成功", "install")
+        except Exception as e:
+            self.log("warn", f"部署后脚本执行失败: {e}", "install")
+
     # ------------------------------------------------------------------
     # 配置
     # ------------------------------------------------------------------
@@ -219,7 +252,7 @@ class LocalDeployEngine(BaseDeployEngine):
         project_json_path = self.project_dir / "project.json"
         if project_json_path.exists():
             try:
-                with open(project_json_path, "r", encoding="utf-8") as f:
+                with open(project_json_path, "r", encoding="utf-8-sig") as f:
                     project_config = json.load(f)
                 self.log("info", "已加载 project.json 配置", "configure")
                 # 可在此处根据配置更新 Nginx/Tomcat 配置

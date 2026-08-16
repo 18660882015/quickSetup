@@ -49,6 +49,38 @@ class DeployExecuteRequest(BaseModel):
     is_local: bool = Field(default=False)
     deploy_dir: Optional[str] = Field(default=None, description="部署目录")
     version: Optional[str] = Field(default=None, description="版本号")
+    post_deploy_script: Optional[str] = Field(
+        default=None, description="部署后自定义脚本（命令或项目内 .sh/.bat 文件名）"
+    )
+
+
+class QuickDeployRequest(BaseModel):
+    """极简快速部署请求：智能识别项目并自动填充配置"""
+    project_name: str = Field(..., description="项目名称")
+    is_local: bool = Field(default=True, description="是否本地部署")
+    host_id: Optional[int] = Field(default=None, description="远程主机ID")
+    env_type: str = Field(default="prod", description="环境类型")
+
+
+class BatchDeployItem(BaseModel):
+    """批量部署单项"""
+    project_name: str = Field(..., description="项目名称")
+    host_id: Optional[int] = Field(default=None, description="主机ID")
+    is_local: bool = Field(default=False)
+    env_type: str = Field(default="prod")
+    jdk_version: str = Field(default="8")
+    db_name: Optional[str] = Field(default=None)
+
+
+class BatchDeployRequest(BaseModel):
+    """批量部署请求：多个项目按顺序部署"""
+    items: List[BatchDeployItem] = Field(..., min_length=1, description="部署项列表")
+
+
+class QuickDeployResponse(BaseModel):
+    """快速部署响应（含识别结果）"""
+    task_id: int
+    detected: Dict[str, Any] = Field(default_factory=dict)
 
 
 class DeployRecordResponse(BaseModel):
